@@ -6,9 +6,10 @@ integration calls during its config flow and for ongoing API requests.
 Browser operations (Selenium) run in a thread pool to keep the event loop
 responsive.
 
-The browser session is kept alive after login so that subsequent API calls
-can be proxied through the browser's authenticated fetch context — the same
-pattern garmin-givemydata uses for all its API calls.
+Supports multiple Garmin accounts via per-user browser profiles.  Only one
+browser instance runs at a time to conserve RAM; when a request arrives for
+a different user the current browser is saved and a new one is opened with
+the target user's profile (fast session restore, ~10-15 s).
 """
 
 import asyncio
@@ -36,9 +37,7 @@ logging.basicConfig(
 )
 log = logging.getLogger("garmin_auth")
 
-BROWSER_PROFILE_DIR = Path("/data/browser_profile")
-SESSION_FILE = Path("/data/garmin_session.json")
-CREDENTIALS_FILE = Path("/data/.credentials.json")
+SESSIONS_DIR = Path("/data/sessions")
 API_PORT = 8099
 
 # Browser idle timeout — close after 10 min of no API calls to save RAM
@@ -47,66 +46,108 @@ BROWSER_IDLE_TIMEOUT = 600
 _executor = ThreadPoolExecutor(max_workers=1)
 _login_lock = asyncio.Lock()
 
-# Persistent browser state — kept alive for API proxying
-_browser_client = None
-_browser_email = None
-_browser_password = None
-_last_api_call = 0.0
+# ── Per-user session registry ────────────────────────────────────
+#
+# Each registered user gets an isolated directory under SESSIONS_DIR
+# containing a browser_profile/, session.json, and credentials.json.
+# Only ONE browser can be active at a time (_active_email).
+
+_sessions: dict[str, dict] = {}
+_active_email: str | None = None
+_active_gc = None
+_last_api_call: float = 0.0
 
 
-def _load_stored_credentials() -> None:
-    """Load credentials saved from a previous login (survives add-on restart)."""
-    global _browser_email, _browser_password
-    if CREDENTIALS_FILE.exists():
-        try:
-            creds = json.loads(CREDENTIALS_FILE.read_text())
-            _browser_email = creds.get("email")
-            _browser_password = creds.get("password")
-            if _browser_email:
-                log.info("Loaded stored credentials for %s", _browser_email)
-        except Exception:
-            log.debug("Could not load stored credentials", exc_info=True)
+def _user_key(email: str) -> str:
+    """Normalise email to a consistent dict key."""
+    return email.strip().lower()
+
+
+def _user_dir(email: str) -> Path:
+    """Return the per-user storage directory, creating it if needed."""
+    d = SESSIONS_DIR / _user_key(email).replace("@", "_at_").replace(".", "_")
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _profile_dir(email: str) -> Path:
+    return _user_dir(email) / "browser_profile"
+
+
+def _session_file(email: str) -> Path:
+    return _user_dir(email) / "session.json"
+
+
+def _credentials_file(email: str) -> Path:
+    return _user_dir(email) / "credentials.json"
 
 
 def _save_credentials(email: str, password: str) -> None:
-    """Persist credentials so the add-on can re-login after restart."""
+    """Persist credentials for a user (survives add-on restart)."""
     try:
-        CREDENTIALS_FILE.write_text(json.dumps({"email": email, "password": password}))
-        CREDENTIALS_FILE.chmod(0o600)
+        f = _credentials_file(email)
+        f.write_text(json.dumps({"email": email, "password": password}))
+        f.chmod(0o600)
     except Exception:
-        log.debug("Could not save credentials", exc_info=True)
+        log.debug("Could not save credentials for %s", email, exc_info=True)
+
+
+def _load_all_credentials() -> None:
+    """Scan SESSIONS_DIR for saved credentials and register sessions."""
+    if not SESSIONS_DIR.exists():
+        return
+    for user_d in SESSIONS_DIR.iterdir():
+        cred_file = user_d / "credentials.json"
+        if cred_file.exists():
+            try:
+                creds = json.loads(cred_file.read_text())
+                email = creds.get("email", "")
+                password = creds.get("password", "")
+                if email:
+                    key = _user_key(email)
+                    _sessions[key] = {
+                        "email": email,
+                        "password": password,
+                        "last_api_call": 0.0,
+                    }
+                    log.info("Loaded stored credentials for %s", email)
+            except Exception:
+                log.debug(
+                    "Could not load credentials from %s", cred_file, exc_info=True
+                )
+
+
+def _register_session(email: str, password: str) -> None:
+    """Register or update a user session in the registry."""
+    key = _user_key(email)
+    _sessions[key] = {
+        "email": email,
+        "password": password,
+        "last_api_call": time.time(),
+    }
+    _save_credentials(email, password)
 
 
 # ── Blocking browser operations (run in executor) ───────────────
 
 
-def _clear_browser_session() -> None:
-    """Delete session file and browser profile cookies to force a fresh login."""
-    if SESSION_FILE.exists():
-        SESSION_FILE.unlink()
-        log.info("Cleared session file for user switch")
-    cookies_dir = BROWSER_PROFILE_DIR / "Default"
-    for name in ("Cookies", "Cookies-journal"):
-        f = cookies_dir / name
-        if f.exists():
-            f.unlink()
-            log.info("Cleared browser cookie file: %s", name)
-
-
 def _do_login(email: str, password: str) -> dict:
     """Perform browser-based Garmin login (blocking).
 
-    On success the GarminClient is returned (key ``_gc``) so the caller
-    can keep the browser alive for API proxying.
+    Uses a per-user browser profile so each account's cookies are isolated.
+    On success the GarminClient is returned (key ``_gc``).
     """
     from garmin_client import GarminClient
+
+    profile = _profile_dir(email)
+    session = _session_file(email)
 
     gc = GarminClient(
         email=email,
         password=password,
         headless=True,
-        profile_dir=BROWSER_PROFILE_DIR,
-        session_file=SESSION_FILE,
+        profile_dir=profile,
+        session_file=session,
         install_signal_handlers=False,
     )
 
@@ -122,46 +163,6 @@ def _do_login(email: str, password: str) -> dict:
     if not result:
         gc.close()
         return {"status": "error", "message": "Browser login failed"}
-
-    # Verify the logged-in identity matches the requested email.
-    # The browser profile may restore a stale session for a different user.
-    display = gc._display_name or ""
-    if display and email:
-        # Fetch the social profile to check the actual email
-        try:
-            profile = gc.api_fetch("/gc-api/userprofile-service/socialProfile")
-            logged_email = (profile or {}).get("email", "")
-            if logged_email and logged_email.lower() != email.lower():
-                log.warning(
-                    "Session mismatch: requested %s but browser is %s — forcing re-login",
-                    email,
-                    logged_email,
-                )
-                gc.close()
-                _clear_browser_session()
-                # Retry login with a clean profile
-                gc2 = GarminClient(
-                    email=email,
-                    password=password,
-                    headless=True,
-                    profile_dir=BROWSER_PROFILE_DIR,
-                    session_file=SESSION_FILE,
-                    install_signal_handlers=False,
-                )
-                try:
-                    result2 = gc2.login(return_on_mfa=True)
-                except Exception as e:
-                    gc2.close()
-                    return {"status": "error", "message": f"Re-login failed: {e}"}
-                if result2 == "needs_mfa":
-                    return {"status": "needs_mfa", "_gc": gc2}
-                if not result2:
-                    gc2.close()
-                    return {"status": "error", "message": "Re-login failed after session clear"}
-                tokens2 = gc2.get_auth_tokens()
-                return {"status": "ok", "tokens": tokens2, "_gc": gc2}
-        except Exception:
-            log.debug("Could not verify logged-in email, proceeding", exc_info=True)
 
     tokens = gc.get_auth_tokens()
     return {"status": "ok", "tokens": tokens, "_gc": gc}
@@ -184,12 +185,7 @@ def _do_mfa(gc, code: str) -> dict:
 
 
 def _do_api_fetch(gc, path: str, method: str = "GET") -> dict:
-    """Proxy an API request through the browser's fetch context (blocking).
-
-    Uses the same pattern as garmin-givemydata's api_fetch(): runs
-    JavaScript fetch() inside the authenticated browser page so that
-    all cookies and TLS fingerprinting are handled by Chrome.
-    """
+    """Proxy an API request through the browser's fetch context (blocking)."""
     gc._ensure_on_garmin()
     csrf = gc._ensure_csrf()
 
@@ -238,6 +234,60 @@ def _do_close_browser(gc) -> None:
         pass
 
 
+# ── Session switching ────────────────────────────────────────────
+
+
+async def _switch_to_user(email: str) -> bool:
+    """Switch the active browser to *email*'s session.
+
+    Closes the current browser (saving cookies via the per-user profile),
+    then opens a new browser with the target user's profile for a fast
+    session restore.  Must be called inside ``_login_lock``.
+
+    Returns True on success; False if the target user has no stored
+    credentials and cannot be logged in.
+    """
+    global _active_email, _active_gc, _last_api_call
+
+    loop = asyncio.get_event_loop()
+
+    # Close current browser (profile auto-saves cookies on exit)
+    if _active_gc is not None:
+        log.info("Saving session for %s before switching", _active_email)
+        await loop.run_in_executor(_executor, _do_close_browser, _active_gc)
+        _active_gc = None
+
+    key = _user_key(email)
+    sess = _sessions.get(key)
+    if not sess or not sess.get("password"):
+        log.error("No stored credentials for %s — cannot switch", email)
+        return False
+
+    log.info("Switching browser session to %s", email)
+    result = await loop.run_in_executor(
+        _executor, _do_login, sess["email"], sess["password"]
+    )
+
+    if result.get("status") == "ok":
+        _active_gc = result.pop("_gc")
+        _active_email = email
+        _last_api_call = time.time()
+        sess["last_api_call"] = _last_api_call
+        log.info("Session switch to %s complete", email)
+        return True
+
+    if result.get("status") == "needs_mfa":
+        # MFA needed — can't auto-switch.  Close the half-started browser.
+        gc = result.pop("_gc", None)
+        if gc:
+            await loop.run_in_executor(_executor, _do_close_browser, gc)
+        log.warning("Cannot auto-switch to %s — MFA required", email)
+        return False
+
+    log.error("Session switch to %s failed: %s", email, result.get("message"))
+    return False
+
+
 # ── HTTP handlers ────────────────────────────────────────────────
 
 
@@ -246,8 +296,9 @@ async def handle_health(request):
     return web.json_response(
         {
             "status": "ok",
-            "browser_active": _browser_client is not None,
-            "logged_in_email": _browser_email,
+            "browser_active": _active_gc is not None,
+            "logged_in_email": _active_email,
+            "registered_users": list(_sessions.keys()),
         }
     )
 
@@ -259,8 +310,9 @@ async def handle_login(request):
     Returns: {"status": "ok", "tokens": {...}} or {"status": "needs_mfa"}
 
     After successful login the browser stays alive for API proxying.
+    The user's profile and credentials are stored for future fast switching.
     """
-    global _browser_client, _browser_email, _browser_password, _last_api_call
+    global _active_gc, _active_email, _last_api_call
 
     data = await request.json()
     email = data.get("email")
@@ -276,38 +328,26 @@ async def handle_login(request):
         loop = asyncio.get_event_loop()
 
         # Close any existing browser session
-        if _browser_client is not None:
-            log.info("Closing previous browser session")
-            await loop.run_in_executor(_executor, _do_close_browser, _browser_client)
-            _browser_client = None
-
-        # When switching users, clear session/cookies so the browser
-        # doesn't auto-restore the previous user's session.
-        if _browser_email and _browser_email.lower() != email.lower():
-            log.info(
-                "User switch detected: %s → %s — clearing browser session",
-                _browser_email,
-                email,
-            )
-            await loop.run_in_executor(_executor, _clear_browser_session)
+        if _active_gc is not None:
+            log.info("Closing previous browser session (%s)", _active_email)
+            await loop.run_in_executor(_executor, _do_close_browser, _active_gc)
+            _active_gc = None
 
         log.info("Starting browser login for %s", email)
         result = await loop.run_in_executor(_executor, _do_login, email, password)
 
         if result["status"] == "needs_mfa":
-            _browser_client = result.pop("_gc")
-            _browser_email = email
-            _browser_password = password
-            _save_credentials(email, password)
+            _active_gc = result.pop("_gc")
+            _active_email = email
+            _register_session(email, password)
             log.info("MFA required — browser kept alive for code submission")
             return web.json_response({"status": "needs_mfa"})
 
         if result["status"] == "ok":
-            _browser_client = result.pop("_gc")
-            _browser_email = email
-            _browser_password = password
-            _save_credentials(email, password)
+            _active_gc = result.pop("_gc")
+            _active_email = email
             _last_api_call = time.time()
+            _register_session(email, password)
             log.info("Login successful — browser kept alive for API proxying")
         else:
             log.warning("Login failed: %s", result.get("message"))
@@ -321,7 +361,7 @@ async def handle_mfa(request):
     Body: {"code": "123456"}
     Returns: {"status": "ok", "tokens": {...}}
     """
-    global _browser_client, _last_api_call
+    global _active_gc, _last_api_call
 
     data = await request.json()
     code = data.get("code")
@@ -332,24 +372,24 @@ async def handle_mfa(request):
             status=400,
         )
 
-    if _browser_client is None:
+    if _active_gc is None:
         return web.json_response(
             {"status": "error", "message": "No pending MFA session"},
             status=400,
         )
 
-    gc = _browser_client
+    gc = _active_gc
 
     log.info("Submitting MFA code (%d chars)", len(code))
     loop = asyncio.get_event_loop()
     result = await loop.run_in_executor(_executor, _do_mfa, gc, code)
 
     if result["status"] == "ok":
-        _browser_client = result.pop("_gc")
+        _active_gc = result.pop("_gc")
         _last_api_call = time.time()
         log.info("MFA successful — browser kept alive for API proxying")
     else:
-        _browser_client = None
+        _active_gc = None
         log.warning("MFA failed: %s", result.get("message"))
 
     return web.json_response(result)
@@ -358,37 +398,49 @@ async def handle_mfa(request):
 async def handle_fetch(request):
     """POST /api/fetch — proxy an API request through the browser.
 
-    Body: {"path": "/gc-api/...", "method": "GET"}
+    Body: {"path": "/gc-api/...", "method": "GET", "email": "user@example.com"}
     Returns: the upstream response (status code + JSON body).
 
-    The request is executed via the browser's JavaScript fetch() context,
-    which automatically includes all cookies and TLS fingerprinting.
+    When ``email`` is provided and differs from the active session, the
+    add-on automatically switches to that user's browser profile (fast
+    session restore via per-user cookies).
     """
-    global _browser_client, _last_api_call
+    global _active_gc, _active_email, _last_api_call
 
     data = await request.json()
     path = data.get("path")
     method = data.get("method", "GET").upper()
+    requested_email = data.get("email")
 
     if not path:
         return web.json_response(
             {"status": "error", "message": "path required"}, status=400
         )
 
-    if _browser_client is None:
-        # Try to re-establish browser session with stored credentials
-        if _browser_email and _browser_password:
-            log.info("Browser closed — re-establishing session")
-            async with _login_lock:
-                loop = asyncio.get_event_loop()
-                result = await loop.run_in_executor(
-                    _executor, _do_login, _browser_email, _browser_password
+    async with _login_lock:
+        # Switch users if the request is for a different account
+        if (
+            requested_email
+            and _active_email
+            and _user_key(requested_email) != _user_key(_active_email)
+        ):
+            ok = await _switch_to_user(requested_email)
+            if not ok:
+                return web.json_response(
+                    {
+                        "status": "error",
+                        "message": f"Cannot switch to {requested_email}",
+                    },
+                    status=401,
                 )
-                if result["status"] == "ok":
-                    _browser_client = result.pop("_gc")
-                    _last_api_call = time.time()
-                    log.info("Browser session re-established")
-                else:
+
+        # Re-establish session if the browser was closed (idle timeout, etc.)
+        if _active_gc is None:
+            target = requested_email or _active_email
+            if target and _user_key(target) in _sessions:
+                log.info("Browser closed — re-establishing session for %s", target)
+                ok = await _switch_to_user(target)
+                if not ok:
                     return web.json_response(
                         {
                             "status": "error",
@@ -396,20 +448,24 @@ async def handle_fetch(request):
                         },
                         status=401,
                     )
-        else:
-            return web.json_response(
-                {
-                    "status": "error",
-                    "message": "No active browser session — login first",
-                },
-                status=401,
-            )
+            else:
+                return web.json_response(
+                    {
+                        "status": "error",
+                        "message": "No active browser session — login first",
+                    },
+                    status=401,
+                )
 
-    _last_api_call = time.time()
-    loop = asyncio.get_event_loop()
-    result = await loop.run_in_executor(
-        _executor, _do_api_fetch, _browser_client, path, method
-    )
+        _last_api_call = time.time()
+        key = _user_key(_active_email) if _active_email else None
+        if key and key in _sessions:
+            _sessions[key]["last_api_call"] = _last_api_call
+
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(
+            _executor, _do_api_fetch, _active_gc, path, method
+        )
 
     if result.get("error"):
         log.warning("Browser fetch failed for %s: %s", path, result["error"])
@@ -431,11 +487,11 @@ async def handle_fetch(request):
 
 async def _idle_browser_cleanup(app):
     """Periodically close the browser if idle to conserve RAM."""
-    global _browser_client
+    global _active_gc
     while True:
         await asyncio.sleep(60)
         if (
-            _browser_client is not None
+            _active_gc is not None
             and _last_api_call > 0
             and time.time() - _last_api_call > BROWSER_IDLE_TIMEOUT
         ):
@@ -443,8 +499,9 @@ async def _idle_browser_cleanup(app):
                 "Browser idle for %ds — closing to save RAM",
                 int(time.time() - _last_api_call),
             )
-            gc = _browser_client
-            _browser_client = None
+            gc = _active_gc
+            _active_gc = None
+            # Don't clear _active_email — it tracks the last user for re-login
             loop = asyncio.get_event_loop()
             await loop.run_in_executor(_executor, _do_close_browser, gc)
 
@@ -452,7 +509,7 @@ async def _idle_browser_cleanup(app):
 # ── Application ──────────────────────────────────────────────────
 
 
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 
 
 def create_app() -> web.Application:
@@ -474,7 +531,7 @@ async def _on_startup(app):
 
 
 if __name__ == "__main__":
-    _load_stored_credentials()
+    _load_all_credentials()
     log.info("Starting Garmin Auth API v%s on port %d", VERSION, API_PORT)
     app = create_app()
     web.run_app(app, host="0.0.0.0", port=API_PORT)
