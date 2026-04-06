@@ -388,18 +388,29 @@ async def _idle_browser_cleanup(app):
 # ── Application ──────────────────────────────────────────────────
 
 
+VERSION = "0.2.1"
+
+
 def create_app() -> web.Application:
     app = web.Application()
     app.router.add_get("/api/health", handle_health)
     app.router.add_post("/api/login", handle_login)
     app.router.add_post("/api/mfa", handle_mfa)
     app.router.add_post("/api/fetch", handle_fetch)
-    app.on_startup.append(lambda app: asyncio.ensure_future(_idle_browser_cleanup(app)))
+    app.on_startup.append(_on_startup)
     return app
+
+
+async def _on_startup(app):
+    """Log readiness and start idle cleanup."""
+    log.info("Garmin Auth API v%s ready — listening on port %d", VERSION, API_PORT)
+    routes = [r.resource.canonical for r in app.router.routes() if r.resource]
+    log.info("Registered routes: %s", ", ".join(sorted(set(routes))))
+    asyncio.ensure_future(_idle_browser_cleanup(app))
 
 
 if __name__ == "__main__":
     _load_stored_credentials()
-    log.info("Starting Garmin Auth API on port %d", API_PORT)
+    log.info("Starting Garmin Auth API v%s on port %d", VERSION, API_PORT)
     app = create_app()
     web.run_app(app, host="0.0.0.0", port=API_PORT)
