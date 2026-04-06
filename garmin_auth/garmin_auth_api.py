@@ -80,6 +80,19 @@ def _save_credentials(email: str, password: str) -> None:
 # ── Blocking browser operations (run in executor) ───────────────
 
 
+def _clear_browser_session() -> None:
+    """Delete session file and browser profile cookies to force a fresh login."""
+    if SESSION_FILE.exists():
+        SESSION_FILE.unlink()
+        log.info("Cleared session file for user switch")
+    cookies_dir = BROWSER_PROFILE_DIR / "Default"
+    for name in ("Cookies", "Cookies-journal"):
+        f = cookies_dir / name
+        if f.exists():
+            f.unlink()
+            log.info("Cleared browser cookie file: %s", name)
+
+
 def _do_login(email: str, password: str) -> dict:
     """Perform browser-based Garmin login (blocking).
 
@@ -109,6 +122,46 @@ def _do_login(email: str, password: str) -> dict:
     if not result:
         gc.close()
         return {"status": "error", "message": "Browser login failed"}
+
+    # Verify the logged-in identity matches the requested email.
+    # The browser profile may restore a stale session for a different user.
+    display = gc._display_name or ""
+    if display and email:
+        # Fetch the social profile to check the actual email
+        try:
+            profile = gc.api_fetch("/gc-api/userprofile-service/socialProfile")
+            logged_email = (profile or {}).get("email", "")
+            if logged_email and logged_email.lower() != email.lower():
+                log.warning(
+                    "Session mismatch: requested %s but browser is %s — forcing re-login",
+                    email,
+                    logged_email,
+                )
+                gc.close()
+                _clear_browser_session()
+                # Retry login with a clean profile
+                gc2 = GarminClient(
+                    email=email,
+                    password=password,
+                    headless=True,
+                    profile_dir=BROWSER_PROFILE_DIR,
+                    session_file=SESSION_FILE,
+                    install_signal_handlers=False,
+                )
+                try:
+                    result2 = gc2.login(return_on_mfa=True)
+                except Exception as e:
+                    gc2.close()
+                    return {"status": "error", "message": f"Re-login failed: {e}"}
+                if result2 == "needs_mfa":
+                    return {"status": "needs_mfa", "_gc": gc2}
+                if not result2:
+                    gc2.close()
+                    return {"status": "error", "message": "Re-login failed after session clear"}
+                tokens2 = gc2.get_auth_tokens()
+                return {"status": "ok", "tokens": tokens2, "_gc": gc2}
+        except Exception:
+            log.debug("Could not verify logged-in email, proceeding", exc_info=True)
 
     tokens = gc.get_auth_tokens()
     return {"status": "ok", "tokens": tokens, "_gc": gc}
@@ -194,6 +247,7 @@ async def handle_health(request):
         {
             "status": "ok",
             "browser_active": _browser_client is not None,
+            "logged_in_email": _browser_email,
         }
     )
 
@@ -219,15 +273,25 @@ async def handle_login(request):
         )
 
     async with _login_lock:
+        loop = asyncio.get_event_loop()
+
         # Close any existing browser session
         if _browser_client is not None:
             log.info("Closing previous browser session")
-            loop = asyncio.get_event_loop()
             await loop.run_in_executor(_executor, _do_close_browser, _browser_client)
             _browser_client = None
 
+        # When switching users, clear session/cookies so the browser
+        # doesn't auto-restore the previous user's session.
+        if _browser_email and _browser_email.lower() != email.lower():
+            log.info(
+                "User switch detected: %s → %s — clearing browser session",
+                _browser_email,
+                email,
+            )
+            await loop.run_in_executor(_executor, _clear_browser_session)
+
         log.info("Starting browser login for %s", email)
-        loop = asyncio.get_event_loop()
         result = await loop.run_in_executor(_executor, _do_login, email, password)
 
         if result["status"] == "needs_mfa":
@@ -388,7 +452,7 @@ async def _idle_browser_cleanup(app):
 # ── Application ──────────────────────────────────────────────────
 
 
-VERSION = "0.2.1"
+VERSION = "0.3.0"
 
 
 def create_app() -> web.Application:
