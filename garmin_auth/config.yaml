@@ -13,3 +13,7 @@ ports:
   8099/tcp: null
 ports_description:
   8099/tcp: "Internal API for Garmin Connect integration"
+options:
+  log_level: info
+schema:
+  log_level: list(debug|info|warning|error)

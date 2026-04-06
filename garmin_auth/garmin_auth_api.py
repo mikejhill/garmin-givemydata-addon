@@ -7,14 +7,25 @@ run in a thread pool to keep the event loop responsive.
 """
 
 import asyncio
+import json
 import logging
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from aiohttp import web
 
+# Read add-on options (HA writes them to /data/options.json)
+_OPTIONS_FILE = Path("/data/options.json")
+_log_level_str = "info"
+if _OPTIONS_FILE.exists():
+    try:
+        _opts = json.loads(_OPTIONS_FILE.read_text())
+        _log_level_str = _opts.get("log_level", "info")
+    except Exception:
+        pass
+
 logging.basicConfig(
-    level=logging.INFO,
+    level=getattr(logging, _log_level_str.upper(), logging.INFO),
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 log = logging.getLogger("garmin_auth")
