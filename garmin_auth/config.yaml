@@ -1,0 +1,15 @@
+name: "Garmin Auth"
+version: "0.1.0"
+slug: "garmin_auth"
+description: "Browser-based Garmin Connect authentication using SeleniumBase UC Chrome. Companion add-on for the Garmin Connect integration."
+url: "https://github.com/mikejhill/garmin-givemydata-addon"
+arch:
+  - amd64
+  - aarch64
+init: false
+startup: services
+boot: auto
+ports:
+  8099/tcp: null
+ports_description:
+  8099/tcp: "Internal API for Garmin Connect integration"
