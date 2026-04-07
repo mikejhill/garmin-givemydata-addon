@@ -134,7 +134,8 @@ def _register_session(email: str, password: str) -> None:
 # ── Blocking browser operations (run in executor) ───────────────
 
 # Constants matching python-garminconnect for DI token exchange
-PORTAL_SSO_SERVICE_URL = "https://connect.garmin.com/app"
+MOBILE_SSO_SERVICE_URL = "https://mobile.integration.garmin.com/gcm/android"
+MOBILE_SSO_CLIENT_ID = "GCM_ANDROID_DARK"
 DI_TOKEN_URL = "https://diauth.garmin.com/di-oauth2-service/oauth/token"
 DI_GRANT_TYPE = (
     "https://connectapi.garmin.com/di-oauth2-service/oauth/grant/service_ticket"
@@ -149,9 +150,9 @@ DI_CLIENT_IDS = (
 def _extract_di_tokens(gc) -> dict:
     """Get DI OAuth2 tokens by leveraging the browser's SSO session.
 
-    After browser login, the SSO cookies (GARMIN-SSO-CUST-GUID etc.)
-    allow us to request a fresh CAS service ticket, which we exchange
-    for DI Bearer tokens.  These are what connectapi.garmin.com requires.
+    After browser login, the SSO cookies (CASTGC etc.) allow us to request
+    a fresh CAS service ticket via the mobile SSO redirect, which we then
+    exchange for DI Bearer tokens that connectapi.garmin.com requires.
     """
     # Step 1: Extract cookies from the browser
     try:
@@ -179,31 +180,31 @@ def _extract_di_tokens(gc) -> dict:
             "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
         )
 
-    # Step 2: Request a new CAS service ticket using the SSO session
-    cas_url = (
-        f"https://sso.garmin.com/cas/login"
-        f"?service={PORTAL_SSO_SERVICE_URL}"
-        f"&clientId=GarminConnect"
-    )
+    # Step 2: Use CASTGC cookie to get a fresh service ticket via SSO redirect
+    sso_url = "https://sso.garmin.com/mobile/sso/en_US/sign-in"
     try:
         r = sess.get(
-            cas_url,
+            sso_url,
+            params={
+                "clientId": MOBILE_SSO_CLIENT_ID,
+                "service": MOBILE_SSO_SERVICE_URL,
+            },
             headers={"User-Agent": ua},
             allow_redirects=False,
             timeout=15,
         )
     except Exception as e:
-        log.debug("CAS ticket request failed: %s", e)
+        log.debug("SSO ticket request failed: %s", e)
         return {}
 
     if r.status_code != 302:
-        log.debug("Expected 302 from CAS, got %d", r.status_code)
+        log.debug("Expected 302 from SSO redirect, got %d", r.status_code)
         return {}
 
     location = r.headers.get("Location", "")
     ticket = parse_qs(urlparse(location).query).get("ticket", [None])[0]
     if not ticket:
-        log.debug("No ticket in CAS redirect: %s", location[:200])
+        log.debug("No ticket in SSO redirect: %s", location[:200])
         return {}
 
     log.debug("Got CAS service ticket: %s...", ticket[:20])
@@ -223,7 +224,7 @@ def _extract_di_tokens(gc) -> dict:
                     "client_id": client_id,
                     "service_ticket": ticket,
                     "grant_type": DI_GRANT_TYPE,
-                    "service_url": PORTAL_SSO_SERVICE_URL,
+                    "service_url": MOBILE_SSO_SERVICE_URL,
                 },
                 timeout=30,
             )
