@@ -153,23 +153,44 @@ def _extract_di_tokens(gc) -> dict:
     After browser login, the SSO cookies (CASTGC etc.) allow us to request
     a fresh CAS service ticket via the mobile SSO redirect, which we then
     exchange for DI Bearer tokens that connectapi.garmin.com requires.
+
+    NOTE: driver.get_cookies() only returns cookies for the current domain,
+    so we must navigate to sso.garmin.com to access the CASTGC cookie.
     """
-    # Step 1: Extract cookies from the browser
+    # Step 1: Get ALL cookies via Chrome DevTools Protocol (all domains)
     try:
-        browser_cookies = gc._driver.get_cookies()
-    except Exception as e:
-        log.debug("Could not extract browser cookies: %s", e)
-        return {}
+        cdp_cookies = gc._driver.execute_cdp_cmd("Network.getAllCookies", {})
+        browser_cookies = cdp_cookies.get("cookies", [])
+        log.debug(
+            "CDP returned %d cookies across all domains",
+            len(browser_cookies),
+        )
+    except Exception:
+        # Fallback: navigate to SSO domain to get cookies there
+        log.debug("CDP getAllCookies not available, navigating to SSO domain")
+        try:
+            gc._driver.get("https://sso.garmin.com")
+            browser_cookies = gc._driver.get_cookies()
+        except Exception as e:
+            log.debug("Could not get SSO cookies: %s", e)
+            return {}
 
     # Build a requests session with the browser's cookies
     sess = http_requests.Session()
+    castgc_found = False
     for c in browser_cookies:
-        sess.cookies.set(
-            c["name"],
-            c["value"],
-            domain=c.get("domain", ".garmin.com"),
-            path=c.get("path", "/"),
-        )
+        name = c.get("name", "")
+        value = c.get("value", "")
+        domain = c.get("domain", ".garmin.com")
+        sess.cookies.set(name, value, domain=domain, path=c.get("path", "/"))
+        if name == "CASTGC":
+            castgc_found = True
+
+    if not castgc_found:
+        log.warning("CASTGC cookie not found — SSO session may not be established")
+        return {}
+
+    log.debug("CASTGC found, requesting fresh service ticket")
 
     # Match the browser's User-Agent so cf_clearance is accepted
     try:
