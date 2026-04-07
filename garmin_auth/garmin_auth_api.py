@@ -2,21 +2,20 @@
 """Garmin Auth Add-on: HTTP API for browser-based Garmin Connect authentication.
 
 Runs a lightweight aiohttp server on port 8099 that the Garmin Connect
-integration calls during its config flow and for ongoing API requests.
-Browser operations (Selenium) run in a thread pool to keep the event loop
-responsive.
+integration calls during its config flow.  Browser operations (Selenium)
+run in a thread pool to keep the event loop responsive.
 
-Supports multiple Garmin accounts via per-user browser profiles.  Only one
-browser instance runs at a time to conserve RAM; when a request arrives for
-a different user the current browser is saved and a new one is opened with
-the target user's profile (fast session restore, ~10-15 s).
+Auth-only model: the browser is used solely for login and DI token extraction.
+After tokens are extracted, the browser is closed and the integration uses
+them via normal HTTP calls to Garmin's APIs.
+
+Supports multiple Garmin accounts via per-user browser profiles.
 """
 
 import asyncio
 import base64
 import json
 import logging
-import random
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -43,9 +42,6 @@ log = logging.getLogger("garmin_auth")
 SESSIONS_DIR = Path("/data/sessions")
 API_PORT = 8099
 
-# Browser idle timeout — close after 10 min of no API calls to save RAM
-BROWSER_IDLE_TIMEOUT = 600
-
 _executor = ThreadPoolExecutor(max_workers=1)
 _login_lock = asyncio.Lock()
 
@@ -53,12 +49,10 @@ _login_lock = asyncio.Lock()
 #
 # Each registered user gets an isolated directory under SESSIONS_DIR
 # containing a browser_profile/, session.json, and credentials.json.
-# Only ONE browser can be active at a time (_active_email).
 
 _sessions: dict[str, dict] = {}
 _active_email: str | None = None
 _active_gc = None
-_last_api_call: float = 0.0
 
 
 def _user_key(email: str) -> str:
@@ -146,100 +140,128 @@ DI_CLIENT_IDS = (
     "GARMIN_CONNECT_MOBILE_ANDROID_DI_2024Q4",
     "GARMIN_CONNECT_MOBILE_ANDROID_DI",
 )
-DESKTOP_USER_AGENT = (
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
-)
+
+
+def _wait_for_cf_clearance(driver, timeout: int = 45) -> bool:
+    """Poll the browser until the Cloudflare challenge resolves.
+
+    Returns True once the page title no longer contains 'Just a moment'
+    (the CF challenge indicator) and the DOM is ready.
+    """
+    start = time.time()
+    while time.time() - start < timeout:
+        try:
+            title = driver.execute_script("return document.title || ''")
+            if "just a moment" not in title.lower():
+                ready = driver.execute_script(
+                    "return document.readyState === 'complete'"
+                )
+                if ready:
+                    return True
+        except Exception:
+            # UC mode may disconnect CDP during CF handling — that's OK
+            pass
+        time.sleep(1)
+    return False
 
 
 def _extract_di_tokens(gc, email: str = "", password: str = "") -> dict:
-    """Get DI OAuth2 tokens via server-side portal login.
+    """Get DI OAuth2 tokens using the browser to bypass Cloudflare.
 
-    Uses plain HTTP requests to call the SSO portal login API — the same
-    approach as python-garminconnect's _portal_web_login_requests.  This
-    avoids browser CF challenge issues entirely (the browser is not
-    involved in this step).
+    Navigates the already-open Selenium browser to the SSO sign-in page
+    using SeleniumBase UC mode (which handles CF challenges automatically),
+    then uses a same-origin JS fetch() to POST credentials to the portal
+    login API.  The resulting service ticket is exchanged server-side for
+    DI OAuth2 Bearer tokens.
 
-    The 30-45 second wait between GET and POST is required: Cloudflare
-    expects human-like timing between loading a page and submitting a form.
+    This avoids the 30-45 second server-side CF delay entirely.
     """
     if not email or not password:
         log.warning("Email/password not provided for DI token extraction")
         return {}
 
-    sess = http_requests.Session()
-    signin_url = f"{SSO_BASE}/portal/sso/en-US/sign-in"
-
-    get_headers = {
-        "User-Agent": DESKTOP_USER_AGENT,
-        "Accept": ("text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"),
-        "Accept-Language": "en-US,en;q=0.9",
-    }
-
-    # Step 1: GET the SSO sign-in page (establishes CF + session cookies)
-    try:
-        r = sess.get(
-            signin_url,
-            params={
-                "clientId": PORTAL_SSO_CLIENT_ID,
-                "service": PORTAL_SSO_SERVICE_URL,
-            },
-            headers=get_headers,
-            timeout=30,
-        )
-        log.debug("SSO sign-in page: %d (%d bytes)", r.status_code, len(r.text))
-    except Exception as e:
-        log.debug("Failed to load SSO sign-in page: %s", e)
+    driver = getattr(gc, "_driver", None)
+    if driver is None:
+        log.warning("No browser driver available for DI extraction")
         return {}
 
-    # Step 2: Wait (CF timing requirement — same as python-garminconnect)
-    wait = random.uniform(30, 45)
-    log.debug("Waiting %.0fs before portal login POST (CF timing requirement)", wait)
-    time.sleep(wait)
-
-    # Step 3: POST credentials to portal login API
-    login_url = f"{SSO_BASE}/portal/api/login"
-    post_headers = {
-        "User-Agent": DESKTOP_USER_AGENT,
-        "Accept": "application/json, text/plain, */*",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Content-Type": "application/json",
-        "Origin": SSO_BASE,
-        "Referer": (
-            f"{signin_url}?clientId={PORTAL_SSO_CLIENT_ID}"
-            f"&service={PORTAL_SSO_SERVICE_URL}"
-        ),
-    }
-
+    # Step 1: Navigate to SSO sign-in page (UC mode handles CF challenge)
+    signin_url = (
+        f"{SSO_BASE}/portal/sso/en-US/sign-in"
+        f"?clientId={PORTAL_SSO_CLIENT_ID}"
+        f"&service={PORTAL_SSO_SERVICE_URL}"
+    )
+    log.debug("Navigating browser to SSO for DI token extraction")
     try:
-        r = sess.post(
-            login_url,
-            params={
-                "clientId": PORTAL_SSO_CLIENT_ID,
-                "locale": "en-US",
-                "service": PORTAL_SSO_SERVICE_URL,
-            },
-            headers=post_headers,
-            json={
-                "username": email,
-                "password": password,
-                "rememberMe": True,
-                "captchaToken": "",
-            },
-            timeout=30,
-        )
+        driver.uc_open_with_reconnect(signin_url, 12)
     except Exception as e:
-        log.debug("Portal login POST failed: %s", e)
+        log.debug("UC navigate to SSO failed: %s", e)
         return {}
 
-    if r.status_code == 429:
+    # Step 2: Wait for CF challenge to resolve
+    if not _wait_for_cf_clearance(driver, timeout=45):
+        log.warning("CF challenge did not resolve within timeout")
+        return {}
+
+    log.debug("CF challenge resolved — posting credentials via JS fetch")
+
+    # Step 3: POST credentials via same-origin JS fetch (no CORS issues)
+    login_api = (
+        f"/portal/api/login"
+        f"?clientId={PORTAL_SSO_CLIENT_ID}"
+        f"&locale=en-US"
+        f"&service={PORTAL_SSO_SERVICE_URL}"
+    )
+
+    js_fetch = """
+    var callback = arguments[arguments.length - 1];
+    (async function() {
+        try {
+            var resp = await fetch(arguments[0], {
+                method: 'POST',
+                credentials: 'include',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'Accept': 'application/json, text/plain, */*'
+                },
+                body: JSON.stringify({
+                    username: arguments[1],
+                    password: arguments[2],
+                    rememberMe: true,
+                    captchaToken: ''
+                })
+            });
+            var text = await resp.text();
+            return {status: resp.status, body: text};
+        } catch(e) {
+            return {error: e.toString()};
+        }
+    })().then(callback).catch(function(e) {
+        callback({error: e.toString()});
+    });
+    """
+
+    try:
+        result = driver.execute_async_script(js_fetch, login_api, email, password)
+    except Exception as e:
+        log.debug("JS portal login fetch failed: %s", e)
+        return {}
+
+    if not result or result.get("error"):
+        log.debug("Portal login JS error: %s", result)
+        return {}
+
+    status = result.get("status", 0)
+    body = result.get("body", "")
+
+    if status == 429:
         log.warning("Portal login rate limited (429)")
         return {}
 
     try:
-        data = r.json()
+        data = json.loads(body)
     except Exception:
-        log.debug("Portal login returned non-JSON (CF block?): HTTP %d", r.status_code)
+        log.debug("Portal login returned non-JSON (HTTP %d): %.200s", status, body)
         return {}
 
     resp_type = data.get("responseStatus", {}).get("type")
@@ -249,10 +271,9 @@ def _extract_di_tokens(gc, email: str = "", password: str = "") -> dict:
         log.debug("Portal login: type=%s (expected SUCCESSFUL)", resp_type)
         return {}
 
-    log.debug("Got CAS service ticket via portal login: %s...", ticket[:20])
+    log.debug("Got CAS service ticket via browser: %s...", ticket[:20])
 
-    # Step 4: Exchange service ticket for DI tokens
-    # service_url must match the service used in portal login
+    # Step 4: Exchange service ticket for DI tokens (server-side)
     for client_id in DI_CLIENT_IDS:
         auth = "Basic " + base64.b64encode(f"{client_id}:".encode()).decode()
         try:
@@ -374,110 +395,12 @@ def _do_mfa(gc, code: str, email: str = "", password: str = "") -> dict:
     return {"status": "ok", "tokens": tokens, "_gc": gc}
 
 
-def _do_api_fetch(gc, path: str, method: str = "GET") -> dict:
-    """Proxy an API request through the browser's fetch context (blocking)."""
-    gc._ensure_on_garmin()
-    csrf = gc._ensure_csrf()
-
-    try:
-        result = gc._driver.execute_async_script(
-            """
-            var callback = arguments[arguments.length - 1];
-            var url = arguments[0];
-            var csrf = arguments[1];
-            var method = arguments[2];
-            (async function() {
-                try {
-                    var resp = await fetch(url, {
-                        method: method,
-                        credentials: 'include',
-                        headers: {
-                            'connect-csrf-token': csrf || '',
-                            'Accept': 'application/json',
-                            'NK': 'NT'
-                        }
-                    });
-                    var body = await resp.text();
-                    return {status: resp.status, body: body};
-                } catch(e) {
-                    return {error: e.toString()};
-                }
-            })().then(callback).catch(function(e) {
-                callback({error: e.toString()});
-            });
-        """,
-            path,
-            csrf,
-            method,
-        )
-    except Exception as e:
-        return {"error": str(e)}
-
-    return result or {"error": "No response from browser"}
-
-
 def _do_close_browser(gc) -> None:
     """Close the browser session (blocking)."""
     try:
         gc.close()
     except Exception:
         pass
-
-
-# ── Session switching ────────────────────────────────────────────
-
-
-async def _switch_to_user(email: str) -> bool:
-    """Switch the active browser to *email*'s session.
-
-    Closes the current browser (saving cookies via the per-user profile),
-    then opens a new browser with the target user's profile for a fast
-    session restore.  Must be called inside ``_login_lock``.
-
-    Returns True on success; False if the target user has no stored
-    credentials and cannot be logged in.
-    """
-    global _active_email, _active_gc, _last_api_call
-
-    loop = asyncio.get_event_loop()
-
-    # Pre-flight: verify the target has credentials BEFORE tearing down
-    # the current browser, so a failed switch doesn't orphan the active session.
-    key = _user_key(email)
-    sess = _sessions.get(key)
-    if not sess or not sess.get("password"):
-        log.error("No stored credentials for %s — cannot switch", email)
-        return False
-
-    # Close current browser (profile auto-saves cookies on exit)
-    if _active_gc is not None:
-        log.info("Saving session for %s before switching", _active_email)
-        await loop.run_in_executor(_executor, _do_close_browser, _active_gc)
-        _active_gc = None
-
-    log.info("Switching browser session to %s", email)
-    result = await loop.run_in_executor(
-        _executor, _do_login, sess["email"], sess["password"]
-    )
-
-    if result.get("status") == "ok":
-        _active_gc = result.pop("_gc")
-        _active_email = email
-        _last_api_call = time.time()
-        sess["last_api_call"] = _last_api_call
-        log.info("Session switch to %s complete", email)
-        return True
-
-    if result.get("status") == "needs_mfa":
-        # MFA needed — can't auto-switch.  Close the half-started browser.
-        gc = result.pop("_gc", None)
-        if gc:
-            await loop.run_in_executor(_executor, _do_close_browser, gc)
-        log.warning("Cannot auto-switch to %s — MFA required", email)
-        return False
-
-    log.error("Session switch to %s failed: %s", email, result.get("message"))
-    return False
 
 
 # ── HTTP handlers ────────────────────────────────────────────────
@@ -501,10 +424,10 @@ async def handle_login(request):
     Body: {"email": "...", "password": "..."}
     Returns: {"status": "ok", "tokens": {...}} or {"status": "needs_mfa"}
 
-    After successful login the browser stays alive for API proxying.
-    The user's profile and credentials are stored for future fast switching.
+    After successful login, tokens are extracted and the browser is closed.
+    The user's profile and credentials are stored for future logins.
     """
-    global _active_gc, _active_email, _last_api_call
+    global _active_gc, _active_email
 
     data = await request.json()
     email = data.get("email")
@@ -556,7 +479,7 @@ async def handle_mfa(request):
     Body: {"code": "123456"}
     Returns: {"status": "ok", "tokens": {...}}
     """
-    global _active_gc, _last_api_call
+    global _active_gc
 
     data = await request.json()
     code = data.get("code")
@@ -601,133 +524,10 @@ async def handle_mfa(request):
     return web.json_response(result)
 
 
-async def handle_fetch(request):
-    """POST /api/fetch — proxy an API request through the browser.
-
-    Body: {"path": "/gc-api/...", "method": "GET", "email": "user@example.com"}
-    Returns: the upstream response (status code + JSON body).
-
-    When ``email`` is provided and differs from the active session, the
-    add-on automatically switches to that user's browser profile (fast
-    session restore via per-user cookies).
-    """
-    global _active_gc, _active_email, _last_api_call
-
-    data = await request.json()
-    path = data.get("path")
-    method = data.get("method", "GET").upper()
-    requested_email = data.get("email")
-
-    if not path:
-        return web.json_response(
-            {"status": "error", "message": "path required"}, status=400
-        )
-
-    async with _login_lock:
-        # Switch users if the request is for a different account
-        if requested_email and _user_key(requested_email) != _user_key(
-            _active_email or ""
-        ):
-            if _user_key(requested_email) in _sessions:
-                ok = await _switch_to_user(requested_email)
-                if not ok:
-                    return web.json_response(
-                        {
-                            "status": "error",
-                            "message": f"Cannot switch to {requested_email}",
-                        },
-                        status=401,
-                    )
-            else:
-                # User never logged in via /api/login — don't disrupt the
-                # current session; just tell the caller this user isn't set up.
-                return web.json_response(
-                    {
-                        "status": "error",
-                        "message": (
-                            f"User {requested_email} not registered — "
-                            "log in via the add-on first"
-                        ),
-                    },
-                    status=401,
-                )
-
-        # Re-establish session if the browser was closed (idle timeout, etc.)
-        if _active_gc is None:
-            target = requested_email or _active_email
-            if target and _user_key(target) in _sessions:
-                log.info("Browser closed — re-establishing session for %s", target)
-                ok = await _switch_to_user(target)
-                if not ok:
-                    return web.json_response(
-                        {
-                            "status": "error",
-                            "message": "Browser session expired, re-login required",
-                        },
-                        status=401,
-                    )
-            else:
-                return web.json_response(
-                    {
-                        "status": "error",
-                        "message": "No active browser session — login first",
-                    },
-                    status=401,
-                )
-
-        _last_api_call = time.time()
-        key = _user_key(_active_email) if _active_email else None
-        if key and key in _sessions:
-            _sessions[key]["last_api_call"] = _last_api_call
-
-        loop = asyncio.get_event_loop()
-        result = await loop.run_in_executor(
-            _executor, _do_api_fetch, _active_gc, path, method
-        )
-
-    if result.get("error"):
-        log.warning("Browser fetch failed for %s: %s", path, result["error"])
-        return web.json_response(result, status=502)
-
-    status = result.get("status", 500)
-    body = result.get("body", "")
-    log.debug("Browser fetch %s %s → %d (%d bytes)", method, path, status, len(body))
-
-    return web.Response(
-        status=status,
-        body=body,
-        content_type="application/json",
-    )
-
-
-# ── Idle browser cleanup ────────────────────────────────────────
-
-
-async def _idle_browser_cleanup(app):
-    """Periodically close the browser if idle to conserve RAM."""
-    global _active_gc
-    while True:
-        await asyncio.sleep(60)
-        if (
-            _active_gc is not None
-            and _last_api_call > 0
-            and time.time() - _last_api_call > BROWSER_IDLE_TIMEOUT
-        ):
-            log.info(
-                "Browser idle for %ds — closing to save RAM",
-                int(time.time() - _last_api_call),
-            )
-            gc = _active_gc
-            _active_gc = None
-            # Don't clear _active_email — it tracks the last user for re-login
-            loop = asyncio.get_event_loop()
-            await loop.run_in_executor(_executor, _do_close_browser, gc)
-
-
 # ── Application ──────────────────────────────────────────────────
 
 
-VERSION = "0.7.1"
+VERSION = "0.8.0"
 
 
 def create_app() -> web.Application:
@@ -735,17 +535,15 @@ def create_app() -> web.Application:
     app.router.add_get("/api/health", handle_health)
     app.router.add_post("/api/login", handle_login)
     app.router.add_post("/api/mfa", handle_mfa)
-    app.router.add_post("/api/fetch", handle_fetch)
     app.on_startup.append(_on_startup)
     return app
 
 
 async def _on_startup(app):
-    """Log readiness and start idle cleanup."""
+    """Log readiness."""
     log.info("Garmin Auth API v%s ready — listening on port %d", VERSION, API_PORT)
     routes = [r.resource.canonical for r in app.router.routes() if r.resource]
     log.info("Registered routes: %s", ", ".join(sorted(set(routes))))
-    asyncio.ensure_future(_idle_browser_cleanup(app))
 
 
 if __name__ == "__main__":
