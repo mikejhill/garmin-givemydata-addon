@@ -16,6 +16,7 @@ import asyncio
 import base64
 import json
 import logging
+import random
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -133,6 +134,9 @@ def _register_session(email: str, password: str) -> None:
 # ── Blocking browser operations (run in executor) ───────────────
 
 # Constants matching python-garminconnect for DI token exchange
+SSO_BASE = "https://sso.garmin.com"
+PORTAL_SSO_CLIENT_ID = "GarminConnect"
+PORTAL_SSO_SERVICE_URL = "https://connect.garmin.com/app"
 DI_TOKEN_URL = "https://diauth.garmin.com/di-oauth2-service/oauth/token"
 DI_GRANT_TYPE = (
     "https://connectapi.garmin.com/di-oauth2-service/oauth/grant/service_ticket"
@@ -142,105 +146,113 @@ DI_CLIENT_IDS = (
     "GARMIN_CONNECT_MOBILE_ANDROID_DI_2024Q4",
     "GARMIN_CONNECT_MOBILE_ANDROID_DI",
 )
+DESKTOP_USER_AGENT = (
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+)
 
 
 def _extract_di_tokens(gc, email: str = "", password: str = "") -> dict:
-    """Get DI OAuth2 tokens by leveraging the browser to obtain a CAS ticket.
+    """Get DI OAuth2 tokens via server-side portal login.
 
-    Strategy: Navigate the browser to sso.garmin.com and use JavaScript
-    fetch() to call the portal login API (same-origin, bypasses Cloudflare).
-    This works regardless of whether CASTGC persists across browser restarts.
+    Uses plain HTTP requests to call the SSO portal login API — the same
+    approach as python-garminconnect's _portal_web_login_requests.  This
+    avoids browser CF challenge issues entirely (the browser is not
+    involved in this step).
+
+    The 30-45 second wait between GET and POST is required: Cloudflare
+    expects human-like timing between loading a page and submitting a form.
     """
     if not email or not password:
         log.warning("Email/password not provided for DI token extraction")
         return {}
 
-    # Step 1: Navigate browser to SSO sign-in page (establishes SSO context)
-    sso_signin_url = (
-        "https://sso.garmin.com/portal/sso/en-US/sign-in"
-        "?clientId=GarminConnect"
-        "&service=https://connect.garmin.com/app"
-    )
+    sess = http_requests.Session()
+    signin_url = f"{SSO_BASE}/portal/sso/en-US/sign-in"
+
+    get_headers = {
+        "User-Agent": DESKTOP_USER_AGENT,
+        "Accept": ("text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"),
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+
+    # Step 1: GET the SSO sign-in page (establishes CF + session cookies)
     try:
-        gc._driver.get(sso_signin_url)
+        r = sess.get(
+            signin_url,
+            params={
+                "clientId": PORTAL_SSO_CLIENT_ID,
+                "service": PORTAL_SSO_SERVICE_URL,
+            },
+            headers=get_headers,
+            timeout=30,
+        )
+        log.debug("SSO sign-in page: %d (%d bytes)", r.status_code, len(r.text))
     except Exception as e:
-        log.debug("Failed to navigate to SSO: %s", e)
+        log.debug("Failed to load SSO sign-in page: %s", e)
         return {}
 
-    time.sleep(3)  # Let Cloudflare challenge resolve
+    # Step 2: Wait (CF timing requirement — same as python-garminconnect)
+    wait = random.uniform(30, 45)
+    log.debug("Waiting %.0fs before portal login POST (CF timing requirement)", wait)
+    time.sleep(wait)
 
-    # Step 2: Use browser's JS fetch() to POST credentials to portal API
-    # This is same-origin (sso.garmin.com), so CORS is not an issue
-    # and the browser's CF clearance cookie applies automatically
+    # Step 3: POST credentials to portal login API
+    login_url = f"{SSO_BASE}/portal/api/login"
+    post_headers = {
+        "User-Agent": DESKTOP_USER_AGENT,
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Content-Type": "application/json",
+        "Origin": SSO_BASE,
+        "Referer": (
+            f"{signin_url}?clientId={PORTAL_SSO_CLIENT_ID}"
+            f"&service={PORTAL_SSO_SERVICE_URL}"
+        ),
+    }
+
     try:
-        result = gc._driver.execute_async_script(
-            """
-            var callback = arguments[arguments.length - 1];
-            var email = arguments[0];
-            var password = arguments[1];
-            (async function() {
-                try {
-                    // First, wait a moment for the page to fully load
-                    await new Promise(r => setTimeout(r, 2000));
-
-                    var resp = await fetch(
-                        '/portal/api/login?clientId=GarminConnect'
-                        + '&locale=en-US'
-                        + '&service=https://connect.garmin.com/app',
-                        {
-                            method: 'POST',
-                            credentials: 'include',
-                            headers: {
-                                'Content-Type': 'application/json',
-                                'Accept': 'application/json'
-                            },
-                            body: JSON.stringify({
-                                username: email,
-                                password: password,
-                                rememberMe: true,
-                                captchaToken: ''
-                            })
-                        }
-                    );
-                    var data = await resp.json();
-                    return {
-                        status: resp.status,
-                        type: (data.responseStatus || {}).type || null,
-                        ticket: data.serviceTicketId || null,
-                        error: null
-                    };
-                } catch(e) {
-                    return {error: e.toString()};
-                }
-            })().then(callback).catch(function(e) {
-                callback({error: e.toString()});
-            });
-            """,
-            email,
-            password,
+        r = sess.post(
+            login_url,
+            params={
+                "clientId": PORTAL_SSO_CLIENT_ID,
+                "locale": "en-US",
+                "service": PORTAL_SSO_SERVICE_URL,
+            },
+            headers=post_headers,
+            json={
+                "username": email,
+                "password": password,
+                "rememberMe": True,
+                "captchaToken": "",
+            },
+            timeout=30,
         )
     except Exception as e:
-        log.debug("Browser JS portal login failed: %s", e)
+        log.debug("Portal login POST failed: %s", e)
         return {}
 
-    if not result or result.get("error"):
-        log.debug("Portal API error: %s", result)
+    if r.status_code == 429:
+        log.warning("Portal login rate limited (429)")
         return {}
 
-    ticket = result.get("ticket")
-    if not ticket:
-        log.debug(
-            "No ticket from portal API (status=%s, type=%s)",
-            result.get("status"),
-            result.get("type"),
-        )
+    try:
+        data = r.json()
+    except Exception:
+        log.debug("Portal login returned non-JSON (CF block?): HTTP %d", r.status_code)
         return {}
 
-    log.debug("Got CAS service ticket via browser: %s...", ticket[:20])
+    resp_type = data.get("responseStatus", {}).get("type")
+    ticket = data.get("serviceTicketId")
 
-    # Step 3: Exchange service ticket for DI tokens
-    # service_url must match what was used in the portal login (connect.garmin.com/app)
-    svc_url = "https://connect.garmin.com/app"
+    if resp_type != "SUCCESSFUL" or not ticket:
+        log.debug("Portal login: type=%s (expected SUCCESSFUL)", resp_type)
+        return {}
+
+    log.debug("Got CAS service ticket via portal login: %s...", ticket[:20])
+
+    # Step 4: Exchange service ticket for DI tokens
+    # service_url must match the service used in portal login
     for client_id in DI_CLIENT_IDS:
         auth = "Basic " + base64.b64encode(f"{client_id}:".encode()).decode()
         try:
@@ -255,7 +267,7 @@ def _extract_di_tokens(gc, email: str = "", password: str = "") -> dict:
                     "client_id": client_id,
                     "service_ticket": ticket,
                     "grant_type": DI_GRANT_TYPE,
-                    "service_url": svc_url,
+                    "service_url": PORTAL_SSO_SERVICE_URL,
                 },
                 timeout=30,
             )
@@ -715,7 +727,7 @@ async def _idle_browser_cleanup(app):
 # ── Application ──────────────────────────────────────────────────
 
 
-VERSION = "0.7.0"
+VERSION = "0.7.1"
 
 
 def create_app() -> web.Application:
