@@ -251,17 +251,19 @@ async def _switch_to_user(email: str) -> bool:
 
     loop = asyncio.get_event_loop()
 
-    # Close current browser (profile auto-saves cookies on exit)
-    if _active_gc is not None:
-        log.info("Saving session for %s before switching", _active_email)
-        await loop.run_in_executor(_executor, _do_close_browser, _active_gc)
-        _active_gc = None
-
+    # Pre-flight: verify the target has credentials BEFORE tearing down
+    # the current browser, so a failed switch doesn't orphan the active session.
     key = _user_key(email)
     sess = _sessions.get(key)
     if not sess or not sess.get("password"):
         log.error("No stored credentials for %s — cannot switch", email)
         return False
+
+    # Close current browser (profile auto-saves cookies on exit)
+    if _active_gc is not None:
+        log.info("Saving session for %s before switching", _active_email)
+        await loop.run_in_executor(_executor, _do_close_browser, _active_gc)
+        _active_gc = None
 
     log.info("Switching browser session to %s", email)
     result = await loop.run_in_executor(
@@ -419,17 +421,29 @@ async def handle_fetch(request):
 
     async with _login_lock:
         # Switch users if the request is for a different account
-        if (
-            requested_email
-            and _active_email
-            and _user_key(requested_email) != _user_key(_active_email)
+        if requested_email and _user_key(requested_email) != _user_key(
+            _active_email or ""
         ):
-            ok = await _switch_to_user(requested_email)
-            if not ok:
+            if _user_key(requested_email) in _sessions:
+                ok = await _switch_to_user(requested_email)
+                if not ok:
+                    return web.json_response(
+                        {
+                            "status": "error",
+                            "message": f"Cannot switch to {requested_email}",
+                        },
+                        status=401,
+                    )
+            else:
+                # User never logged in via /api/login — don't disrupt the
+                # current session; just tell the caller this user isn't set up.
                 return web.json_response(
                     {
                         "status": "error",
-                        "message": f"Cannot switch to {requested_email}",
+                        "message": (
+                            f"User {requested_email} not registered — "
+                            "log in via the add-on first"
+                        ),
                     },
                     status=401,
                 )
