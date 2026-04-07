@@ -1,5 +1,5 @@
 name: "Garmin Auth"
-version: "0.4.0"
+version: "0.4.1"
 slug: "garmin_auth"
 description: "Browser-based Garmin Connect authentication using SeleniumBase UC Chrome. Companion add-on for the Garmin Connect integration."
 url: "https://github.com/mikejhill/garmin-givemydata-addon"

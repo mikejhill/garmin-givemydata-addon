@@ -523,7 +523,7 @@ async def _idle_browser_cleanup(app):
 # ── Application ──────────────────────────────────────────────────
 
 
-VERSION = "0.4.0"
+VERSION = "0.4.1"
 
 
 def create_app() -> web.Application:
