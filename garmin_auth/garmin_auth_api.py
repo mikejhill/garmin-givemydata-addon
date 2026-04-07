@@ -346,11 +346,14 @@ async def handle_login(request):
             return web.json_response({"status": "needs_mfa"})
 
         if result["status"] == "ok":
-            _active_gc = result.pop("_gc")
-            _active_email = email
-            _last_api_call = time.time()
+            gc = result.pop("_gc")
             _register_session(email, password)
-            log.info("Login successful — browser kept alive for API proxying")
+            # Close the browser immediately — tokens have been extracted
+            # and the integration uses them via normal HTTP calls.
+            await loop.run_in_executor(_executor, _do_close_browser, gc)
+            _active_gc = None
+            _active_email = email
+            log.info("Login successful — tokens extracted, browser closed")
         else:
             log.warning("Login failed: %s", result.get("message"))
 
@@ -387,9 +390,10 @@ async def handle_mfa(request):
     result = await loop.run_in_executor(_executor, _do_mfa, gc, code)
 
     if result["status"] == "ok":
-        _active_gc = result.pop("_gc")
-        _last_api_call = time.time()
-        log.info("MFA successful — browser kept alive for API proxying")
+        gc = result.pop("_gc")
+        await loop.run_in_executor(_executor, _do_close_browser, gc)
+        _active_gc = None
+        log.info("MFA successful — tokens extracted, browser closed")
     else:
         _active_gc = None
         log.warning("MFA failed: %s", result.get("message"))
@@ -523,7 +527,7 @@ async def _idle_browser_cleanup(app):
 # ── Application ──────────────────────────────────────────────────
 
 
-VERSION = "0.4.1"
+VERSION = "0.5.0"
 
 
 def create_app() -> web.Application:
