@@ -13,12 +13,15 @@ the target user's profile (fast session restore, ~10-15 s).
 """
 
 import asyncio
+import base64
 import json
 import logging
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from urllib.parse import parse_qs, urlparse
 
+import requests as http_requests
 from aiohttp import web
 
 # Read add-on options (HA writes them to /data/options.json)
@@ -130,12 +133,134 @@ def _register_session(email: str, password: str) -> None:
 
 # ── Blocking browser operations (run in executor) ───────────────
 
+# Constants matching python-garminconnect for DI token exchange
+PORTAL_SSO_SERVICE_URL = "https://connect.garmin.com/app"
+DI_TOKEN_URL = "https://diauth.garmin.com/di-oauth2-service/oauth/token"
+DI_GRANT_TYPE = (
+    "https://connectapi.garmin.com/di-oauth2-service/oauth/grant/service_ticket"
+)
+DI_CLIENT_IDS = (
+    "GARMIN_CONNECT_MOBILE_ANDROID_DI_2025Q2",
+    "GARMIN_CONNECT_MOBILE_ANDROID_DI_2024Q4",
+    "GARMIN_CONNECT_MOBILE_ANDROID_DI",
+)
+
+
+def _extract_di_tokens(gc) -> dict:
+    """Get DI OAuth2 tokens by leveraging the browser's SSO session.
+
+    After browser login, the SSO cookies (GARMIN-SSO-CUST-GUID etc.)
+    allow us to request a fresh CAS service ticket, which we exchange
+    for DI Bearer tokens.  These are what connectapi.garmin.com requires.
+    """
+    # Step 1: Extract cookies from the browser
+    try:
+        browser_cookies = gc._driver.get_cookies()
+    except Exception as e:
+        log.debug("Could not extract browser cookies: %s", e)
+        return {}
+
+    # Build a requests session with the browser's cookies
+    sess = http_requests.Session()
+    for c in browser_cookies:
+        sess.cookies.set(
+            c["name"],
+            c["value"],
+            domain=c.get("domain", ".garmin.com"),
+            path=c.get("path", "/"),
+        )
+
+    # Match the browser's User-Agent so cf_clearance is accepted
+    try:
+        ua = gc._driver.execute_script("return navigator.userAgent")
+    except Exception:
+        ua = (
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+        )
+
+    # Step 2: Request a new CAS service ticket using the SSO session
+    cas_url = (
+        f"https://sso.garmin.com/cas/login"
+        f"?service={PORTAL_SSO_SERVICE_URL}"
+        f"&clientId=GarminConnect"
+    )
+    try:
+        r = sess.get(
+            cas_url,
+            headers={"User-Agent": ua},
+            allow_redirects=False,
+            timeout=15,
+        )
+    except Exception as e:
+        log.debug("CAS ticket request failed: %s", e)
+        return {}
+
+    if r.status_code != 302:
+        log.debug("Expected 302 from CAS, got %d", r.status_code)
+        return {}
+
+    location = r.headers.get("Location", "")
+    ticket = parse_qs(urlparse(location).query).get("ticket", [None])[0]
+    if not ticket:
+        log.debug("No ticket in CAS redirect: %s", location[:200])
+        return {}
+
+    log.debug("Got CAS service ticket: %s...", ticket[:20])
+
+    # Step 3: Exchange service ticket for DI tokens
+    for client_id in DI_CLIENT_IDS:
+        auth = "Basic " + base64.b64encode(f"{client_id}:".encode()).decode()
+        try:
+            r = http_requests.post(
+                DI_TOKEN_URL,
+                headers={
+                    "Authorization": auth,
+                    "Content-Type": "application/x-www-form-urlencoded",
+                    "Accept": "application/json",
+                },
+                data={
+                    "client_id": client_id,
+                    "service_ticket": ticket,
+                    "grant_type": DI_GRANT_TYPE,
+                    "service_url": PORTAL_SSO_SERVICE_URL,
+                },
+                timeout=30,
+            )
+        except Exception as e:
+            log.debug("DI exchange request failed for %s: %s", client_id, e)
+            continue
+
+        if not r.ok:
+            log.debug(
+                "DI exchange failed for %s: %d %s",
+                client_id,
+                r.status_code,
+                r.text[:200],
+            )
+            continue
+
+        try:
+            data = r.json()
+            log.info("DI token obtained via client %s", client_id)
+            return {
+                "di_token": data["access_token"],
+                "di_refresh_token": data.get("refresh_token"),
+                "di_client_id": client_id,
+            }
+        except Exception as e:
+            log.debug("DI token parse failed for %s: %s", client_id, e)
+            continue
+
+    log.warning("DI token extraction failed for all client IDs")
+    return {}
+
 
 def _do_login(email: str, password: str) -> dict:
     """Perform browser-based Garmin login (blocking).
 
     Uses a per-user browser profile so each account's cookies are isolated.
-    On success the GarminClient is returned (key ``_gc``).
+    On success extracts both JWT_WEB/CSRF and DI Bearer tokens.
     """
     from garmin_client import GarminClient
 
@@ -165,6 +290,17 @@ def _do_login(email: str, password: str) -> dict:
         return {"status": "error", "message": "Browser login failed"}
 
     tokens = gc.get_auth_tokens()
+
+    # Try to extract DI tokens (needed for connectapi.garmin.com)
+    di_tokens = _extract_di_tokens(gc)
+    if di_tokens:
+        tokens.update(di_tokens)
+    else:
+        log.warning(
+            "Could not extract DI tokens — API calls may fail with 403. "
+            "JWT_WEB fallback will be attempted."
+        )
+
     return {"status": "ok", "tokens": tokens, "_gc": gc}
 
 
@@ -181,6 +317,16 @@ def _do_mfa(gc, code: str) -> dict:
         return {"status": "error", "message": "MFA verification failed"}
 
     tokens = gc.get_auth_tokens()
+
+    # Try to extract DI tokens (needed for connectapi.garmin.com)
+    di_tokens = _extract_di_tokens(gc)
+    if di_tokens:
+        tokens.update(di_tokens)
+    else:
+        log.warning(
+            "Could not extract DI tokens after MFA — API calls may fail with 403."
+        )
+
     return {"status": "ok", "tokens": tokens, "_gc": gc}
 
 
@@ -527,7 +673,7 @@ async def _idle_browser_cleanup(app):
 # ── Application ──────────────────────────────────────────────────
 
 
-VERSION = "0.5.0"
+VERSION = "0.6.0"
 
 
 def create_app() -> web.Application:
