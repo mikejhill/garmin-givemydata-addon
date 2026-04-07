@@ -1,5 +1,9 @@
 # Garmin Connect Auth Add-on Repository
 
+> **⚠️ DEVELOPMENT ONLY — This repository is not intended for general use.**
+> This is an experimental add-on used for development and testing of browser-based
+> Garmin Connect authentication for Home Assistant. It is not stable or supported.
+
 Home Assistant add-on that provides browser-based Garmin Connect authentication
 using [garmin-givemydata](https://github.com/nrvim/garmin-givemydata)'s
 SeleniumBase UC Chrome engine.
