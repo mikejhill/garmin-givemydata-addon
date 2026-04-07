@@ -19,7 +19,6 @@ import logging
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from urllib.parse import parse_qs, urlparse
 
 import requests as http_requests
 from aiohttp import web
@@ -134,8 +133,6 @@ def _register_session(email: str, password: str) -> None:
 # ── Blocking browser operations (run in executor) ───────────────
 
 # Constants matching python-garminconnect for DI token exchange
-MOBILE_SSO_SERVICE_URL = "https://mobile.integration.garmin.com/gcm/android"
-MOBILE_SSO_CLIENT_ID = "GCM_ANDROID_DARK"
 DI_TOKEN_URL = "https://diauth.garmin.com/di-oauth2-service/oauth/token"
 DI_GRANT_TYPE = (
     "https://connectapi.garmin.com/di-oauth2-service/oauth/grant/service_ticket"
@@ -147,90 +144,103 @@ DI_CLIENT_IDS = (
 )
 
 
-def _extract_di_tokens(gc) -> dict:
-    """Get DI OAuth2 tokens by leveraging the browser's SSO session.
+def _extract_di_tokens(gc, email: str = "", password: str = "") -> dict:
+    """Get DI OAuth2 tokens by leveraging the browser to obtain a CAS ticket.
 
-    After browser login, the SSO cookies (CASTGC etc.) allow us to request
-    a fresh CAS service ticket via the mobile SSO redirect, which we then
-    exchange for DI Bearer tokens that connectapi.garmin.com requires.
-
-    NOTE: driver.get_cookies() only returns cookies for the current domain,
-    so we must navigate to sso.garmin.com to access the CASTGC cookie.
+    Strategy: Navigate the browser to sso.garmin.com and use JavaScript
+    fetch() to call the portal login API (same-origin, bypasses Cloudflare).
+    This works regardless of whether CASTGC persists across browser restarts.
     """
-    # Step 1: Get ALL cookies via Chrome DevTools Protocol (all domains)
-    try:
-        cdp_cookies = gc._driver.execute_cdp_cmd("Network.getAllCookies", {})
-        browser_cookies = cdp_cookies.get("cookies", [])
-        log.debug(
-            "CDP returned %d cookies across all domains",
-            len(browser_cookies),
-        )
-    except Exception:
-        # Fallback: navigate to SSO domain to get cookies there
-        log.debug("CDP getAllCookies not available, navigating to SSO domain")
-        try:
-            gc._driver.get("https://sso.garmin.com")
-            browser_cookies = gc._driver.get_cookies()
-        except Exception as e:
-            log.debug("Could not get SSO cookies: %s", e)
-            return {}
-
-    # Build a requests session with the browser's cookies
-    sess = http_requests.Session()
-    castgc_found = False
-    for c in browser_cookies:
-        name = c.get("name", "")
-        value = c.get("value", "")
-        domain = c.get("domain", ".garmin.com")
-        sess.cookies.set(name, value, domain=domain, path=c.get("path", "/"))
-        if name == "CASTGC":
-            castgc_found = True
-
-    if not castgc_found:
-        log.warning("CASTGC cookie not found — SSO session may not be established")
+    if not email or not password:
+        log.warning("Email/password not provided for DI token extraction")
         return {}
 
-    log.debug("CASTGC found, requesting fresh service ticket")
-
-    # Match the browser's User-Agent so cf_clearance is accepted
+    # Step 1: Navigate browser to SSO sign-in page (establishes SSO context)
+    sso_signin_url = (
+        "https://sso.garmin.com/portal/sso/en-US/sign-in"
+        "?clientId=GarminConnect"
+        "&service=https://connect.garmin.com/app"
+    )
     try:
-        ua = gc._driver.execute_script("return navigator.userAgent")
-    except Exception:
-        ua = (
-            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
-        )
+        gc._driver.get(sso_signin_url)
+    except Exception as e:
+        log.debug("Failed to navigate to SSO: %s", e)
+        return {}
 
-    # Step 2: Use CASTGC cookie to get a fresh service ticket via SSO redirect
-    sso_url = "https://sso.garmin.com/mobile/sso/en_US/sign-in"
+    time.sleep(3)  # Let Cloudflare challenge resolve
+
+    # Step 2: Use browser's JS fetch() to POST credentials to portal API
+    # This is same-origin (sso.garmin.com), so CORS is not an issue
+    # and the browser's CF clearance cookie applies automatically
     try:
-        r = sess.get(
-            sso_url,
-            params={
-                "clientId": MOBILE_SSO_CLIENT_ID,
-                "service": MOBILE_SSO_SERVICE_URL,
-            },
-            headers={"User-Agent": ua},
-            allow_redirects=False,
-            timeout=15,
+        result = gc._driver.execute_async_script(
+            """
+            var callback = arguments[arguments.length - 1];
+            var email = arguments[0];
+            var password = arguments[1];
+            (async function() {
+                try {
+                    // First, wait a moment for the page to fully load
+                    await new Promise(r => setTimeout(r, 2000));
+
+                    var resp = await fetch(
+                        '/portal/api/login?clientId=GarminConnect'
+                        + '&locale=en-US'
+                        + '&service=https://connect.garmin.com/app',
+                        {
+                            method: 'POST',
+                            credentials: 'include',
+                            headers: {
+                                'Content-Type': 'application/json',
+                                'Accept': 'application/json'
+                            },
+                            body: JSON.stringify({
+                                username: email,
+                                password: password,
+                                rememberMe: true,
+                                captchaToken: ''
+                            })
+                        }
+                    );
+                    var data = await resp.json();
+                    return {
+                        status: resp.status,
+                        type: (data.responseStatus || {}).type || null,
+                        ticket: data.serviceTicketId || null,
+                        error: null
+                    };
+                } catch(e) {
+                    return {error: e.toString()};
+                }
+            })().then(callback).catch(function(e) {
+                callback({error: e.toString()});
+            });
+            """,
+            email,
+            password,
         )
     except Exception as e:
-        log.debug("SSO ticket request failed: %s", e)
+        log.debug("Browser JS portal login failed: %s", e)
         return {}
 
-    if r.status_code != 302:
-        log.debug("Expected 302 from SSO redirect, got %d", r.status_code)
+    if not result or result.get("error"):
+        log.debug("Portal API error: %s", result)
         return {}
 
-    location = r.headers.get("Location", "")
-    ticket = parse_qs(urlparse(location).query).get("ticket", [None])[0]
+    ticket = result.get("ticket")
     if not ticket:
-        log.debug("No ticket in SSO redirect: %s", location[:200])
+        log.debug(
+            "No ticket from portal API (status=%s, type=%s)",
+            result.get("status"),
+            result.get("type"),
+        )
         return {}
 
-    log.debug("Got CAS service ticket: %s...", ticket[:20])
+    log.debug("Got CAS service ticket via browser: %s...", ticket[:20])
 
     # Step 3: Exchange service ticket for DI tokens
+    # service_url must match what was used in the portal login (connect.garmin.com/app)
+    svc_url = "https://connect.garmin.com/app"
     for client_id in DI_CLIENT_IDS:
         auth = "Basic " + base64.b64encode(f"{client_id}:".encode()).decode()
         try:
@@ -245,7 +255,7 @@ def _extract_di_tokens(gc) -> dict:
                     "client_id": client_id,
                     "service_ticket": ticket,
                     "grant_type": DI_GRANT_TYPE,
-                    "service_url": MOBILE_SSO_SERVICE_URL,
+                    "service_url": svc_url,
                 },
                 timeout=30,
             )
@@ -314,7 +324,7 @@ def _do_login(email: str, password: str) -> dict:
     tokens = gc.get_auth_tokens()
 
     # Try to extract DI tokens (needed for connectapi.garmin.com)
-    di_tokens = _extract_di_tokens(gc)
+    di_tokens = _extract_di_tokens(gc, email=email, password=password)
     if di_tokens:
         tokens.update(di_tokens)
     else:
@@ -326,7 +336,7 @@ def _do_login(email: str, password: str) -> dict:
     return {"status": "ok", "tokens": tokens, "_gc": gc}
 
 
-def _do_mfa(gc, code: str) -> dict:
+def _do_mfa(gc, code: str, email: str = "", password: str = "") -> dict:
     """Submit MFA code via the browser (blocking)."""
     try:
         result = gc.submit_mfa(code)
@@ -341,7 +351,7 @@ def _do_mfa(gc, code: str) -> dict:
     tokens = gc.get_auth_tokens()
 
     # Try to extract DI tokens (needed for connectapi.garmin.com)
-    di_tokens = _extract_di_tokens(gc)
+    di_tokens = _extract_di_tokens(gc, email=email, password=password)
     if di_tokens:
         tokens.update(di_tokens)
     else:
@@ -553,9 +563,19 @@ async def handle_mfa(request):
 
     gc = _active_gc
 
+    # Get credentials for DI token extraction
+    mfa_email = _active_email or ""
+    mfa_password = ""
+    if mfa_email:
+        key = _user_key(mfa_email)
+        sess_data = _sessions.get(key, {})
+        mfa_password = sess_data.get("password", "")
+
     log.info("Submitting MFA code (%d chars)", len(code))
     loop = asyncio.get_event_loop()
-    result = await loop.run_in_executor(_executor, _do_mfa, gc, code)
+    result = await loop.run_in_executor(
+        _executor, _do_mfa, gc, code, mfa_email, mfa_password
+    )
 
     if result["status"] == "ok":
         gc = result.pop("_gc")
@@ -695,7 +715,7 @@ async def _idle_browser_cleanup(app):
 # ── Application ──────────────────────────────────────────────────
 
 
-VERSION = "0.6.1"
+VERSION = "0.7.0"
 
 
 def create_app() -> web.Application:
