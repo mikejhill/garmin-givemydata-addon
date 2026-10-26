@@ -35,4 +35,15 @@ authentication tokens are returned to the integration for API access.
 
 - Supports MFA (the integration's config flow prompts for the code)
 - Browser profile is persisted across restarts for faster re-authentication
-- No credentials are stored by the add-on — they are only used during the login flow
+- Credentials are persisted in per-account storage for automatic reauthentication. Protect the add-on data volume.
+
+## Account storage validation
+
+Account names containing path separators, drive/stream colons, or control
+characters are rejected with HTTP 400 before browser login. Ordinary accounts
+keep their existing normalized storage directory; this change does not migrate
+or rewrite saved credentials. Account directories resolving outside session
+storage (including symlinks) are rejected.
+
+Run the credential-free containment regression tests with the add-on runtime
+requirements installed: `python -m unittest discover -s tests -v`.

@@ -16,6 +16,7 @@ import asyncio
 import base64
 import json
 import logging
+import os
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -60,9 +61,26 @@ def _user_key(email: str) -> str:
     return email.strip().lower()
 
 
+def _user_directory_name(email: str) -> str:
+    """Preserve legacy account names while rejecting filesystem path syntax."""
+    if not isinstance(email, str) or not email.strip():
+        raise ValueError("Invalid account email")
+    key = _user_key(email)
+    if any(character in "/\\:" or ord(character) < 32 for character in key):
+        raise ValueError("Invalid account email")
+    return key.replace("@", "_at_").replace(".", "_")
+
+
 def _user_dir(email: str) -> Path:
-    """Return the per-user storage directory, creating it if needed."""
-    d = SESSIONS_DIR / _user_key(email).replace("@", "_at_").replace(".", "_")
+    """Return a contained per-user directory, preserving existing safe paths."""
+    name = Path(_user_directory_name(email)).name
+    root = os.path.realpath(SESSIONS_DIR)
+    directory = os.path.realpath(os.path.join(root, name))
+    if not directory.startswith(root + os.sep):
+        raise ValueError("Account directory must stay within session storage")
+    d = Path(directory)
+    if d.parent != Path(root):
+        raise ValueError("Account directory must be a direct child of session storage")
     d.mkdir(parents=True, exist_ok=True)
     return d
 
@@ -244,11 +262,11 @@ def _extract_di_tokens(gc, email: str = "", password: str = "") -> dict:
     try:
         result = driver.execute_async_script(js_fetch, login_api, email, password)
     except Exception as e:
-        log.debug("JS portal login fetch failed: %s", e)
+        log.debug("JS portal login fetch failed: %s", type(e).__name__)
         return {}
 
     if not result or result.get("error"):
-        log.debug("Portal login JS error: %s", result)
+        log.debug("Portal login JS error")
         return {}
 
     status = result.get("status", 0)
@@ -261,7 +279,7 @@ def _extract_di_tokens(gc, email: str = "", password: str = "") -> dict:
     try:
         data = json.loads(body)
     except Exception:
-        log.debug("Portal login returned non-JSON (HTTP %d): %.200s", status, body)
+        log.debug("Portal login returned non-JSON (HTTP %d)", status)
         return {}
 
     resp_type = data.get("responseStatus", {}).get("type")
@@ -271,7 +289,7 @@ def _extract_di_tokens(gc, email: str = "", password: str = "") -> dict:
         log.debug("Portal login: type=%s (expected SUCCESSFUL)", resp_type)
         return {}
 
-    log.debug("Got CAS service ticket via browser: %s...", ticket[:20])
+    log.debug("Got CAS service ticket via browser")
 
     # Step 4: Exchange service ticket for DI tokens (server-side)
     for client_id in DI_CLIENT_IDS:
@@ -293,15 +311,14 @@ def _extract_di_tokens(gc, email: str = "", password: str = "") -> dict:
                 timeout=30,
             )
         except Exception as e:
-            log.debug("DI exchange request failed for %s: %s", client_id, e)
+            log.debug("DI exchange request failed for %s: %s", client_id, type(e).__name__)
             continue
 
         if not r.ok:
             log.debug(
-                "DI exchange failed for %s: %d %s",
+                "DI exchange failed for %s: HTTP %d",
                 client_id,
                 r.status_code,
-                r.text[:200],
             )
             continue
 
@@ -314,7 +331,7 @@ def _extract_di_tokens(gc, email: str = "", password: str = "") -> dict:
                 "di_client_id": client_id,
             }
         except Exception as e:
-            log.debug("DI token parse failed for %s: %s", client_id, e)
+            log.debug("DI token parse failed for %s: %s", client_id, type(e).__name__)
             continue
 
     log.warning("DI token extraction failed for all client IDs")
@@ -437,6 +454,13 @@ async def handle_login(request):
         return web.json_response(
             {"status": "error", "message": "email and password required"},
             status=400,
+        )
+
+    try:
+        _user_directory_name(email)
+    except ValueError:
+        return web.json_response(
+            {"status": "error", "message": "Invalid account email"}, status=400
         )
 
     async with _login_lock:
