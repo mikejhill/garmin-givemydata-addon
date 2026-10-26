@@ -16,6 +16,7 @@ import asyncio
 import base64
 import json
 import logging
+import os
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -73,10 +74,13 @@ def _user_directory_name(email: str) -> str:
 def _user_dir(email: str) -> Path:
     """Return a contained per-user directory, preserving existing safe paths."""
     name = Path(_user_directory_name(email)).name
-    root = SESSIONS_DIR.resolve()
-    d = root / name
-    if d.resolve().parent != root:
+    root = os.path.realpath(SESSIONS_DIR)
+    directory = os.path.realpath(os.path.join(root, name))
+    if not directory.startswith(root + os.sep):
         raise ValueError("Account directory must stay within session storage")
+    d = Path(directory)
+    if d.parent != Path(root):
+        raise ValueError("Account directory must be a direct child of session storage")
     d.mkdir(parents=True, exist_ok=True)
     return d
 

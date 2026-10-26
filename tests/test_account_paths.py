@@ -46,7 +46,7 @@ class AccountPathTests(unittest.TestCase):
         """An existing account symlink cannot redirect writes outside storage."""
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "sessions"
-            outside = Path(tmp) / "outside"
+            outside = Path(tmp) / "sessions_other"
             root.mkdir()
             outside.mkdir()
             try:
