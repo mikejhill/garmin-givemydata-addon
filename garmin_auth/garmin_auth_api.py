@@ -72,7 +72,7 @@ def _user_directory_name(email: str) -> str:
 
 def _user_dir(email: str) -> Path:
     """Return a contained per-user directory, preserving existing safe paths."""
-    name = _user_directory_name(email)
+    name = Path(_user_directory_name(email)).name
     root = SESSIONS_DIR.resolve()
     d = root / name
     if d.resolve().parent != root:
