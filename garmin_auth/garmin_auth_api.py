@@ -32,7 +32,8 @@ if _OPTIONS_FILE.exists():
         _opts = json.loads(_OPTIONS_FILE.read_text())
         _log_level_str = _opts.get("log_level", "info")
     except Exception:
-        pass
+        # Unreadable options fall back to the default "info" level.
+        _log_level_str = "info"
 
 logging.basicConfig(
     level=getattr(logging, _log_level_str.upper(), logging.INFO),
@@ -50,6 +51,8 @@ _login_lock = asyncio.Lock()
 #
 # Each registered user gets an isolated directory under SESSIONS_DIR
 # containing a browser_profile/, session.json, and credentials.json.
+# credentials.json records only the account email: passwords stay in memory
+# for the login/MFA exchange and are never written to disk.
 
 _sessions: dict[str, dict] = {}
 _active_email: str | None = None
@@ -59,6 +62,11 @@ _active_gc = None
 def _user_key(email: str) -> str:
     """Normalise email to a consistent dict key."""
     return email.strip().lower()
+
+
+def _log_safe(value: object) -> str:
+    """Render a client-supplied value for logs without line breaks."""
+    return str(value).replace("\r", "").replace("\n", "")
 
 
 def _user_directory_name(email: str) -> str:
@@ -97,14 +105,14 @@ def _credentials_file(email: str) -> Path:
     return _user_dir(email) / "credentials.json"
 
 
-def _save_credentials(email: str, password: str) -> None:
-    """Persist credentials for a user (survives add-on restart)."""
+def _save_account(email: str) -> None:
+    """Record a registered account (survives add-on restart) without its password."""
     try:
         f = _credentials_file(email)
-        f.write_text(json.dumps({"email": email, "password": password}))
+        f.write_text(json.dumps({"email": email}))
         f.chmod(0o600)
     except Exception:
-        log.debug("Could not save credentials for %s", email, exc_info=True)
+        log.debug("Could not save account record for %s", _log_safe(email), exc_info=True)
 
 
 def _load_all_credentials() -> None:
@@ -117,15 +125,20 @@ def _load_all_credentials() -> None:
             try:
                 creds = json.loads(cred_file.read_text())
                 email = creds.get("email", "")
-                password = creds.get("password", "")
+                if "password" in creds:
+                    # Older versions stored the password in clear text; it is
+                    # never read back, so drop it from disk.
+                    cred_file.write_text(json.dumps({"email": email}))
+                    cred_file.chmod(0o600)
+                    log.info("Removed a stored password from %s", cred_file)
                 if email:
                     key = _user_key(email)
                     _sessions[key] = {
                         "email": email,
-                        "password": password,
+                        "password": "",
                         "last_api_call": 0.0,
                     }
-                    log.info("Loaded stored credentials for %s", email)
+                    log.info("Loaded stored account %s", _log_safe(email))
             except Exception:
                 log.debug(
                     "Could not load credentials from %s", cred_file, exc_info=True
@@ -140,7 +153,7 @@ def _register_session(email: str, password: str) -> None:
         "password": password,
         "last_api_call": time.time(),
     }
-    _save_credentials(email, password)
+    _save_account(email)
 
 
 # ── Blocking browser operations (run in executor) ───────────────
@@ -417,7 +430,8 @@ def _do_close_browser(gc) -> None:
     try:
         gc.close()
     except Exception:
-        pass
+        # The browser may already be gone; closing is best effort.
+        log.debug("Browser close failed", exc_info=True)
 
 
 # ── HTTP handlers ────────────────────────────────────────────────
@@ -468,11 +482,11 @@ async def handle_login(request):
 
         # Close any existing browser session
         if _active_gc is not None:
-            log.info("Closing previous browser session (%s)", _active_email)
+            log.info("Closing previous browser session (%s)", _log_safe(_active_email))
             await loop.run_in_executor(_executor, _do_close_browser, _active_gc)
             _active_gc = None
 
-        log.info("Starting browser login for %s", email)
+        log.info("Starting browser login for %s", _log_safe(email))
         result = await loop.run_in_executor(_executor, _do_login, email, password)
 
         if result["status"] == "needs_mfa":

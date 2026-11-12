@@ -2,6 +2,7 @@
 
 import asyncio
 import importlib.util
+import json
 from pathlib import Path
 import tempfile
 import unittest
@@ -95,3 +96,45 @@ class AuthenticationDiagnosticTests(unittest.TestCase):
             result = api._extract_di_tokens(Mock(_driver=driver), "user@example.invalid", "synthetic-password")
         self.assertEqual(result, {}, "Malformed responses must not yield tokens")
         self.assertNotIn("synthetic-", " ".join(captured.output), "Raw auth response must not be logged")
+
+
+class CredentialStorageTests(unittest.TestCase):
+    """Passwords stay in memory; only the account email reaches disk."""
+
+    def setUp(self):
+        self.sessions = {}
+        patcher = patch.object(api, "_sessions", self.sessions)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_registered_password_is_not_written_to_disk(self):
+        """Registering a session records the account without its password."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with patch.object(api, "SESSIONS_DIR", root):
+                api._register_session("User@Example.com", "synthetic-password")
+            stored = (root / "user_at_example_com" / "credentials.json").read_text(encoding="utf-8")
+        self.assertEqual(json.loads(stored), {"email": "User@Example.com"})
+        self.assertNotIn("synthetic-password", stored, "Passwords must never be persisted")
+        self.assertEqual(self.sessions["user@example.com"]["password"], "synthetic-password",
+                         "The in-memory session keeps the password for the MFA exchange")
+
+    def test_legacy_stored_password_is_removed_on_load(self):
+        """Accounts saved by older versions load, and their password is scrubbed."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            account = root / "user_at_example_com"
+            account.mkdir()
+            legacy = account / "credentials.json"
+            legacy.write_text(json.dumps({"email": "user@example.com", "password": "synthetic-password"}),
+                              encoding="utf-8")
+            with patch.object(api, "SESSIONS_DIR", root):
+                api._load_all_credentials()
+            stored = legacy.read_text(encoding="utf-8")
+        self.assertEqual(json.loads(stored), {"email": "user@example.com"})
+        self.assertEqual(self.sessions["user@example.com"]["password"], "",
+                         "A stored password must not be loaded back into memory")
+
+    def test_client_values_cannot_forge_log_lines(self):
+        """Line breaks in client-supplied values are removed before logging."""
+        self.assertEqual(api._log_safe("user@example.com\r\nINFO forged"), "user@example.comINFO forged")

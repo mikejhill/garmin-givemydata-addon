@@ -1,2 +1,3 @@
 garmin-givemydata @ git+https://github.com/mikejhill/garmin-givemydata.git@main
-aiohttp>=3.9
+aiohttp>=3.14.4
+requests>=2.33.0
