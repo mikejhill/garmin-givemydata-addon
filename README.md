@@ -35,7 +35,7 @@ authentication tokens are returned to the integration for API access.
 
 - Supports MFA (the integration's config flow prompts for the code)
 - Browser profile is persisted across restarts for faster re-authentication
-- Credentials are persisted in per-account storage for automatic reauthentication. Protect the add-on data volume.
+- Only the account email is persisted in per-account storage; passwords are kept in memory for the login and MFA exchange and are never written to disk. Passwords saved by earlier versions are removed from disk at start-up. Protect the add-on data volume, which still holds the browser profile.
 
 ## Account storage validation
 
